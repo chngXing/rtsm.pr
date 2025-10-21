@@ -1,2 +1,2 @@
 # rtsm.pr
-coding for test
+coding for testing
