@@ -4,7 +4,6 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 import math as mt
-import threading
 
 class LIFNeurons(nn.Module):
     def __init__(self, dt=0.1, tau_m=10.0, v_th=-45.0, v_reset=-65.0, I_bias=-30.0, resting_period_e=2.0, resting_period_d2=1.0):
@@ -23,7 +22,10 @@ class LIFNeurons(nn.Module):
         self.device = None
         self.num_neurons = None
 
-    def reset_state(self, N, device, begin_v=0.0):
+    def reset_state(self, N, device, begin_v=-65.0) -> None:
+        '''
+        Reset the state of the neurons.
+        '''
         self.v = torch.full((N, 1), begin_v, device=device)
         self.spiked = torch.zeros((N, 1), device=device)
         self.I_bias = torch.full((N, 1), self.I_bias_value, device=device)
@@ -32,23 +34,30 @@ class LIFNeurons(nn.Module):
         self.device = device
         self.num_neurons = N
 
-    def resting(self, current_time):
+    def resting(self, current_time) -> torch.Tensor:
         current_time_c = torch.full((self.num_neurons, 1), current_time, device=self.device)
         return (current_time_c - self.last_spike_time) < self.resting_period
 
-    def reset_time(self):
+    def reset_time(self) -> None:
         self.last_spike_time = torch.full((self.num_neurons, 1), -float('inf'), device=self.device)
 
-    def forward(self, input_current, current_time):
+    def forward(self, input_current, current_time) -> tuple[torch.Tensor, torch.Tensor]:
+        '''
+        Perform a forward pass of the LIF neuron model.
+        '''
         dv = (-self.v + input_current + self.I_bias) / self.tau_m * self.dt
         self.v += dv
         spiked = (self.v >= self.v_th).bool()
+
+        # caluculate if the neuron is in resting period
         resting_mask = self.resting(current_time).float()
         ones = torch.ones_like(resting_mask)
-        spiked = spiked * (ones - resting_mask)
+        spiked = spiked * (ones - resting_mask) # filter spikes during resting period
+
         reset_tensor = torch.full_like(self.v, self.v_reset)
         spike_times = torch.full((self.num_neurons, 1), current_time, device=self.device)
-        self.v = torch.where(spiked.bool(), reset_tensor, self.v)
+        self.v = torch.where(spiked.bool(), reset_tensor, self.v) # reset the membrane potential if spiked
+
         self.last_spike_time = torch.where(spiked.bool(), spike_times, self.last_spike_time)
         self.spiked = spiked
 
@@ -62,6 +71,7 @@ class SpikingNeuronNetwork:
                 I_bias=-55.0, p=25.0,
                 q=60.0, p_w=0.1, lambda_=0.1,
                 max_time_delta=200, delay=1.0,
+                alpha=2.0, mean_tau=40.0,
                 begin_v=None, device='cuda'):
         if device == 'cuda' and not torch.cuda.is_available():
             device = 'cpu'
@@ -79,14 +89,14 @@ class SpikingNeuronNetwork:
         self.tau_r = tau_r
         self.time_turn = 0
         self.a = 2 * tau_r * tau_d / (tau_r + tau_d)
-        alpha = 2.0
-        mean_tau = 40.0 / self.dt
-        scale = mean_tau / alpha
-        delay = torch.distributions.Gamma(alpha, scale).sample((num_neurons, 1)) * delay
+        self.alpha = alpha
+        self.mean_tau = mean_tau / self.dt
+        self.scale = self.mean_tau / self.alpha
+        delay = torch.distributions.Gamma(self.alpha, self.scale).sample((num_neurons, 1)) * delay
         self.max_time_delta = max_time_delta
         kernel = []
         for j in range(0, num_neurons):
-            kernel.append([((mt.exp(-((-i + delay[j]) * self.dt / self.a) ** 2) / mt.sqrt(mt.pi)) / self.a * 2) for i in range(-max_time_delta - 1, 0)])
+            kernel.append([((mt.exp(-((-i + delay[j]) * self.dt / self.a) ** 2) / mt.sqrt(mt.pi)) / self.a * 2) for i in range(-max_time_delta - 1, 0)]) # initialize the dirac kernel during time for each neuron
         self.time_delta = torch.tensor(kernel, device=self.device).T
         self.r = torch.zeros((num_neurons, 1), device=self.device)
         self.h = torch.zeros((num_neurons, 1), device=self.device)
@@ -98,7 +108,10 @@ class SpikingNeuronNetwork:
         self.neurons.reset_state(num_neurons, self.device, begin_v if begin_v is not None else self.v_reset)
         self.spike_history = []
 
-    def reset(self, delay=1.0):
+    def reset(self, delay=1.0) -> 'SpikingNeuronNetwork':
+        '''
+        Reset the network state and reinitialize with a new delay.
+        '''
         self.time_turn = 0
         self.r = torch.zeros((self.num_neurons, 1), device=self.device)
         self.h = torch.zeros((self.num_neurons, 1), device=self.device)
@@ -117,7 +130,7 @@ class SpikingNeuronNetwork:
 
         return self
 
-    def delta_(self):
+    def delta_(self) -> torch.Tensor:
         # spike_history: list of tensors shape (N,1), len = time_turn
         begin_time = max(0, self.time_turn - self.max_time_delta)
         # stack -> (T, N, 1) -> squeeze -> (T, N) -> transpose -> (N, T)
@@ -135,7 +148,10 @@ class SpikingNeuronNetwork:
         res = (H * td.T).sum(dim=1, keepdim=True)   # (N,1)
         return res
 
-    def delta(self):
+    def delta(self) -> torch.Tensor:
+        '''
+        return the output using the dirac function
+        '''
         begin_time = self.time_turn - 200 if self.time_turn - 200 > 0 else 0
         end_time = self.time_turn
         time_delta = self.time_delta[self.max_time_delta - (self.time_turn - begin_time): self.max_time_delta + 1]
@@ -143,12 +159,15 @@ class SpikingNeuronNetwork:
         result = torch.sum(spike_history_tensor * time_delta.T, dim=1, keepdim=True)
 
         return result
-    
-    def step_r(self):
+
+    def step_r(self) -> None:
         self.h += self.dt * (-self.h / self.tau_r + self.delta().squeeze(0) / self.tau_r / self.tau_d)
         self.r += self.dt * (-self.r / self.tau_d + self.h)
 
-    def step(self, input_current, noise_std=0.0):
+    def step(self, input_current, noise_std=0.0) -> tuple[float, torch.Tensor]:
+        '''
+        Perform a single time step update of the spiking neuron network.
+        '''
         x = self.phi.T @ self.r
         if not torch.is_tensor(input_current):
             input_current = torch.full((self.num_neurons,), float(input_current), device=self.device)
@@ -164,13 +183,16 @@ class SpikingNeuronNetwork:
         self.step_r()
         self.time_turn += 1
         return x.item(), spike
-    
-    def train(self, target, learning_rate=1.0, train=True):
+
+    def train(self, target, learning_rate=1.0, train=True, train_turn=5) -> torch.Tensor:
+        '''
+        Train the network using Recursive Least Squares (RLS) algorithm.
+        '''
         r_vector = self.r
         Pr = self.P @ r_vector
         k = Pr / (1.0 + (r_vector.T @ Pr))
         error = target - (self.phi.T @ r_vector).squeeze(0)
-        if self.time_turn % 50 == 0 and train:
+        if self.time_turn % train_turn == 0 and train:   # update weights every train_turn time steps when training
             self.P -= k @ Pr.T
             Pr = self.P @ r_vector
             self.phi += learning_rate * error * Pr
@@ -178,12 +200,15 @@ class SpikingNeuronNetwork:
 
         return error
 
-    def reset_time(self):
+    def reset_time(self) -> None:
         self.time_turn = 0
         self.spike_history = []
         self.neurons.reset_time()
 
-    def run(self, simtime, input=None, target=None, train=False, noise_std=60.0, noise_duration=40):
+    def run(self, simtime, input=None, target=None, train=False, noise_std=60.0, noise_duration=40) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        '''
+        Run the spiking neuron network simulation.
+        '''
         max_steps = int(simtime / self.dt)
         spike_rec = torch.zeros(max_steps, self.num_neurons, 1, device=self.device)
         x_rec = torch.zeros(max_steps, device=self.device)
@@ -198,15 +223,24 @@ class SpikingNeuronNetwork:
 
         return x_rec.cpu(), spike_rec.cpu(), errors.cpu()
 
-def simple_validation(simtime=5000.0, num_neurons=2000):
+def simple_validation(simtime=5000.0, num_neurons=2000) -> None:
+    '''
+    Simple validation of SpikingNeuronNetwork with and without delay.
+    '''
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dt = 0.05
     t = np.arange(0, simtime, dt)
     A = [1. / 2., 1. / 10., 1. / 8., 1. / 14., 1. / 4., 1. / 20., 1. / 12., 1. / 18., 1. / 16., 1. / 6.]
+
     target = np.zeros_like(t)
     for i in range(len(A)):
-        target += A[i] * np.sin(4 * mt.pi * (i + 1) * t / 1000.0)# + np.sin(2 * mt.pi * 1.2 * t / 200.0)# + np.sin(2 * mt.pi * 5 * t / 200.0) + np.sin(2 * mt.pi * 7 * t / 200.0) + np.sin(2 * mt.pi * 11 * t / 200.0) + np.sin(2 * mt.pi * 13 * t / 200.0) + np.sin(2 * mt.pi * 17 * t / 200.0)
+        target += A[i] * np.sin(4 * mt.pi * (i + 1) * t / 1000.0)
+ 
+    #target = np.sin(2 * mt.pi * 0.8 * t / 200.0) + np.sin(2 * mt.pi * 1.2 * t / 200.0)# + np.sin(2 * mt.pi * 5 * t / 200.0) + np.sin(2 * mt.pi * 7 * t / 200.0) + np.sin(2 * mt.pi * 11 * t / 200.0) + np.sin(2 * mt.pi * 13 * t / 200.0) + np.sin(2 * mt.pi * 17 * t / 200.0)
+    #target = np.sin(2 * mt.pi * 1 * t / 200.0)
     #input = np.abs(np.sin(2 * mt.pi * 1 * t / 200.0))
+
+    # result of without delay SpikingNeuronNetwork
     net_without_delay = SpikingNeuronNetwork(dt=dt, num_neurons=num_neurons, device=device, delay=0.0)
     x_rec_train_nodelay, spikes_train_nodelay, errors_train_nodelay = net_without_delay.run(simtime * 0.8, input=None, train=True, target=target[:int(simtime/dt * 0.8)])
     x_rec_test_nodelay, spikes_test_nodelay, errors_test_nodelay = net_without_delay.run(simtime * 0.2, input=None, train=False, target=target[int(simtime/dt * 0.8):], noise_duration=0)
@@ -217,6 +251,7 @@ def simple_validation(simtime=5000.0, num_neurons=2000):
     print(f"Device: {device} | spikes (no delay): {spike_counts_nodelay.mean():.2f}")
     spike_counts_nodelay_times = spikes_nodelay.sum(axis=1).reshape(-1, 2).sum(axis=1)
 
+    # result of with delay SpikingNeuronNetwork
     net_with_delay = net_without_delay.reset(delay=1.0)
     x_rec_train, spikes_train, errors_train = net_with_delay.run(simtime * 0.8, input=None, train=True, target=target[:int(simtime/dt * 0.8)])
     x_rec_test, spikes_test, errors_test = net_with_delay.run(simtime * 0.2, input=None, train=False, target=target[int(simtime/dt * 0.8):], noise_duration=0)
@@ -228,6 +263,7 @@ def simple_validation(simtime=5000.0, num_neurons=2000):
     spike_counts_times = spikes.sum(axis=1).reshape(-1, 2).sum(axis=1)
 
     steps = np.arange(x_rec_train_nodelay.shape[0])
+    # Plotting results
     plt.figure(figsize=(12, 9))
     plt.subplot(6, 1, 1)
     plt.plot(t, target, label='Target', color='blue')
@@ -277,6 +313,9 @@ def simple_validation(simtime=5000.0, num_neurons=2000):
 
 
 def test_lif(simtime=100.0, dt=0.1, num_neurons=10, noise_std=1000.0):
+    '''
+    Test the LIF neuron model.
+    '''
     steps = int(simtime / dt)
     neurons = LIFNeurons(dt=dt)
     neurons.reset_state(num_neurons, device='cpu', begin_v=-65.0)
@@ -285,15 +324,13 @@ def test_lif(simtime=100.0, dt=0.1, num_neurons=10, noise_std=1000.0):
     v_record = torch.zeros((steps, num_neurons))
     
     for t in range(steps):
-        # 每个神经元独立噪声输入
         input_current = torch.randn(num_neurons, 1) * noise_std
         spikes, v = neurons.forward(input_current=input_current, current_time=(t * dt))
         spike_record[t] = spikes.squeeze(-1)
         v_record[t] = v.squeeze(-1)
     
     t_array = np.arange(0, simtime, dt)
-    
-    # 画膜电位
+
     plt.figure(figsize=(12, 5))
     for n in range(num_neurons):
         plt.plot(t_array, v_record[:, n], label=f'Neuron {n+1}')
@@ -303,8 +340,7 @@ def test_lif(simtime=100.0, dt=0.1, num_neurons=10, noise_std=1000.0):
     plt.ylabel("Voltage (mV)")
     plt.legend()
     plt.show()
-    
-    # 画 raster plot
+
     plt.figure(figsize=(12, 4))
     plt.imshow(spike_record.T, aspect='auto', cmap='gray_r', extent=[0, simtime, 0, num_neurons])
     plt.title("Spike Raster Plot")
