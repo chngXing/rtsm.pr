@@ -334,6 +334,7 @@ def simple_validation_delay(simtime=2000.0, num_neurons=2000) -> None:
     alpha_values = [1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0]
     tau_values = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 70.0, 100.0]
     errors_matrix = []
+
     for alpha in alpha_values:
         for tau in tau_values:
             net.reset(delay=1.0, alpha=alpha, mean_tau=tau)
@@ -350,9 +351,11 @@ def simple_validation_delay(simtime=2000.0, num_neurons=2000) -> None:
     x_rec_test_nodelay, spikes_test_nodelay, errors_test_nodelay = net.run(simtime -1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
     spikes_nodelay = (torch.cat((spikes_train_nodelay, spikes_test_nodelay), dim=0)).squeeze(-1).cpu().numpy()
     errors_nodelay = torch.square(errors_test_nodelay).sum().cpu().numpy() * dt
-    errors_matrix.append((1.0, 0.0, errors_nodelay))
+    for alpha in alpha_values:
+        errors_matrix.append((alpha, 0.0, errors_nodelay))
     spike_counts_nodelay = spikes_nodelay.sum(axis=0)
     print(f"Device: {device} | spikes (no delay): {spike_counts_nodelay.mean():.2f}")
+
     for tau in tau_values:
         net.reset(delay=1.0, mean_tau=tau, delta=True)
         x_rec_train_delta, spikes_train_delta, errors_train_delta = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
@@ -362,45 +365,34 @@ def simple_validation_delay(simtime=2000.0, num_neurons=2000) -> None:
         errors_matrix.append((float('inf'), tau, errors_delta))
         spike_counts_delta = spikes_delta.sum(axis=0)
         print(f"Device: {device} | spikes (delta delay): {spike_counts_delta.mean():.2f}")
+
     net.reset(delay=1.0, uniform=True)
     x_rec_train_uniform, spikes_train_uniform, errors_train_uniform = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
     x_rec_test_uniform, spikes_test_uniform, errors_test_uniform = net.run(simtime - 1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
     spikes_uniform = (torch.cat((spikes_train_uniform, spikes_test_uniform), dim=0)).squeeze(-1).cpu().numpy()
     errors_uniform = torch.square(errors_test_uniform).sum().cpu().numpy() * dt
-    errors_matrix.append((1, float('inf'), errors_uniform))
+    for alpha in alpha_values:
+        errors_matrix.append((alpha, float('inf'), errors_uniform))
     spike_counts_uniform = spikes_uniform.sum(axis=0)
     print(f"Device: {device} | spikes (uniform delay): {spike_counts_uniform.mean():.2f}")
 
-    df = pd.DataFrame(errors_matrix, columns=["alpha", "tau", "error"])
-
-    df["alpha_label"] = df["alpha"].replace({float('inf'): "delta"})
-    df["tau_label"] = df["tau"].replace({
-        0.0: "No delay",
-        float('inf'): "Uniform"
-    })
-
-    alpha_order = ["1.0", "2.0", "5.0", "10.0", "20.0", "30.0", "40.0", "Δ"]
-    tau_order = ["No delay", "0.5", "1.0", "2.0", "5.0", "10.0", "20.0", "40.0", "70.0", "100.0", "Uniform"]
+    alpha_order = ["1.0", "2.0", "5.0", "10.0", "20.0", "30.0", "40.0", "delta"]
+    tau_order = ["no delay", "0.5", "1.0", "2.0", "5.0", "10.0", "20.0", "40.0", "70.0", "100.0", "uniform"]
 
     df = pd.DataFrame(errors_matrix, columns=["alpha", "tau", "error"])
 
-    # 将 alpha = inf 替换成标签 "Delta"，tau = inf 替换成 "Uniform"
-    df["alpha_label"] = df["alpha"].replace({float('inf'): "Delta"})
-    df["tau_label"] = df["tau"].replace({float('inf'): "Uniform", 0.0: "Nodelay"})
+    df["alpha_label"] = df["alpha"].replace({float('inf'): "delta"}).astype(str)
+    df["tau_label"] = df["tau"].replace({float('inf'): "uniform", 0.0: "no delay"}).astype(str)
 
-    # 透视表（pivot table）
     pivot = df.pivot_table(index="alpha_label", columns="tau_label", values="error")
 
-    # 确保数据都是数值（去掉可能的字符串）
     pivot = pivot.apply(pd.to_numeric, errors='coerce')
-    pivot = pivot.reindex(index=alpha_order, columns=tau_order)
+    pivot = pivot.reindex(index=alpha_order[::-1], columns=tau_order)
 
-    # 绘图
     plt.figure(figsize=(10, 6))
     plt.imshow(pivot, cmap="viridis", aspect="auto")
     plt.colorbar(label="Error")
 
-    # 设置坐标轴标签
     plt.xticks(np.arange(len(pivot.columns)), pivot.columns, rotation=45)
     plt.yticks(np.arange(len(pivot.index)), pivot.index)
     plt.xlabel("⟨τ⟩ (mean tau)")
