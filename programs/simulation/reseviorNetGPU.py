@@ -4,6 +4,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 import math as mt
+import pandas as pd
 
 class LIFNeurons(nn.Module):
     def __init__(self, dt=0.1, tau_m=10.0, v_th=-45.0, v_reset=-65.0, I_bias=-30.0, resting_period_e=2.0, resting_period_d2=1.0):
@@ -22,7 +23,7 @@ class LIFNeurons(nn.Module):
         self.device = None
         self.num_neurons = None
 
-    def reset_state(self, N, device, begin_v=-65.0) -> None:
+    def reset_state(self, N, device, begin_v=-65.0, change_resting_period=False) -> None:
         '''
         Reset the state of the neurons.
         '''
@@ -30,7 +31,8 @@ class LIFNeurons(nn.Module):
         self.spiked = torch.zeros((N, 1), device=device)
         self.I_bias = torch.full((N, 1), self.I_bias_value, device=device)
         self.last_spike_time = torch.full((N, 1), -float('inf'), device=device)
-        self.resting_period = torch.full((N, 1), self.resting_period_e, device=device) + torch.randn((N, 1), device=device) * self.resting_period_d2
+        if change_resting_period:
+            self.resting_period = torch.full((N, 1), self.resting_period_e, device=device) + torch.randn((N, 1), device=device) * self.resting_period_d2
         self.device = device
         self.num_neurons = N
 
@@ -105,10 +107,10 @@ class SpikingNeuronNetwork:
         self.phi = torch.zeros((self.num_neurons, 1), device=self.device)
         self.P = torch.eye(num_neurons, device=self.device) / lambda_
         self.neurons = LIFNeurons(dt=dt, tau_m=tau_m, v_th=v_th, v_reset=v_reset, I_bias=I_bias)
-        self.neurons.reset_state(num_neurons, self.device, begin_v if begin_v is not None else self.v_reset)
+        self.neurons.reset_state(N=num_neurons, device=self.device, begin_v=begin_v if begin_v is not None else self.v_reset, change_resting_period=True)
         self.spike_history = []
 
-    def reset(self, delay=1.0) -> 'SpikingNeuronNetwork':
+    def reset(self, delay=1.0, alpha=5.0, mean_tau=20.0, delta=False, uniform=False) -> 'SpikingNeuronNetwork':
         '''
         Reset the network state and reinitialize with a new delay.
         '''
@@ -117,16 +119,21 @@ class SpikingNeuronNetwork:
         self.h = torch.zeros((self.num_neurons, 1), device=self.device)
         self.phi = torch.zeros((self.num_neurons, 1), device=self.device)
         self.P = torch.eye(self.num_neurons, device=self.device) / 0.1
-        alpha = 5.0
-        mean_tau = 20.0 / self.dt
-        scale = mean_tau / alpha
-        delay = torch.distributions.Gamma(alpha, scale).sample((self.num_neurons, 1)) * delay
+        self.alpha = alpha
+        self.mean_tau = mean_tau / self.dt
+        self.scale = self.mean_tau / self.alpha
+        if delta:
+            delay = torch.ones((self.num_neurons, 1), device=self.device) * delay * mean_tau
+        elif uniform:
+            delay = torch.rand((self.num_neurons, 1), device=self.device) * delay * 100.0 / self.dt
+        else:
+            delay = torch.distributions.Gamma(self.alpha, self.scale).sample((self.num_neurons, 1)) * delay
         kernel = []
         for j in range(0, self.num_neurons):
             kernel.append([((mt.exp(-((-i + delay[j]) * self.dt / self.a) ** 2) / mt.sqrt(mt.pi)) / self.a * 2) for i in range(-self.max_time_delta - 1, 0)])
         self.time_delta = torch.tensor(kernel, device=self.device).T
         self.spike_history = []
-        self.neurons.reset_state(self.num_neurons, self.device, self.v_reset)
+        self.neurons.reset_state(self.num_neurons, self.device, self.v_reset, change_resting_period=False)
 
         return self
 
@@ -311,6 +318,97 @@ def simple_validation(simtime=5000.0, num_neurons=2000) -> None:
     plt.ylabel('MSE')
     plt.show()
 
+def simple_validation_delay(simtime=2000.0, num_neurons=2000) -> None:
+    '''
+    Simple validation of SpikingNeuronNetwork with delay changes.
+    '''
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dt = 0.05
+    t = np.arange(0, simtime, dt)
+    A = [1. / 2., 1. / 10., 1. / 8., 1. / 14., 1. / 4., 1. / 20., 1. / 12., 1. / 18., 1. / 16., 1. / 6.]
+
+    target = np.zeros_like(t)
+    for i in range(len(A)):
+        target += A[i] * np.sin(4 * mt.pi * (i + 1) * t / 1000.0)
+    net = SpikingNeuronNetwork(dt=dt, num_neurons=num_neurons, device=device)
+    alpha_values = [1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0]
+    tau_values = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 70.0, 100.0]
+    errors_matrix = []
+    for alpha in alpha_values:
+        for tau in tau_values:
+            net.reset(delay=1.0, alpha=alpha, mean_tau=tau)
+            x_rec_train, spikes_train, errors_train = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
+            x_rec_test, spikes_test, errors_test = net.run(simtime - 1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
+            spikes = (torch.cat((spikes_train, spikes_test), dim=0)).squeeze(-1).cpu().numpy()
+            errors = torch.square(errors_test).sum().cpu().numpy() * dt
+            errors_matrix.append((alpha, tau, errors))
+            spike_counts = spikes.sum(axis=0)
+            print(f"Alpha: {alpha} | Tau: {tau} | spikes: {spike_counts.mean():.2f}")
+
+    net.reset(delay=0.0)
+    x_rec_train_nodelay, spikes_train_nodelay, errors_train_nodelay = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
+    x_rec_test_nodelay, spikes_test_nodelay, errors_test_nodelay = net.run(simtime -1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
+    spikes_nodelay = (torch.cat((spikes_train_nodelay, spikes_test_nodelay), dim=0)).squeeze(-1).cpu().numpy()
+    errors_nodelay = torch.square(errors_test_nodelay).sum().cpu().numpy() * dt
+    errors_matrix.append((1.0, 0.0, errors_nodelay))
+    spike_counts_nodelay = spikes_nodelay.sum(axis=0)
+    print(f"Device: {device} | spikes (no delay): {spike_counts_nodelay.mean():.2f}")
+    for tau in tau_values:
+        net.reset(delay=1.0, mean_tau=tau, delta=True)
+        x_rec_train_delta, spikes_train_delta, errors_train_delta = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
+        x_rec_test_delta, spikes_test_delta, errors_test_delta = net.run(simtime - 1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
+        spikes_delta = (torch.cat((spikes_train_delta, spikes_test_delta), dim=0)).squeeze(-1).cpu().numpy()
+        errors_delta = torch.square(errors_test_delta).sum().cpu().numpy() * dt
+        errors_matrix.append((float('inf'), tau, errors_delta))
+        spike_counts_delta = spikes_delta.sum(axis=0)
+        print(f"Device: {device} | spikes (delta delay): {spike_counts_delta.mean():.2f}")
+    net.reset(delay=1.0, uniform=True)
+    x_rec_train_uniform, spikes_train_uniform, errors_train_uniform = net.run(1000.0, input=None, train=True, target=target[:int(1000.0/dt)])
+    x_rec_test_uniform, spikes_test_uniform, errors_test_uniform = net.run(simtime - 1000.0, input=None, train=False, target=target[int(1000.0/dt):], noise_duration=0)
+    spikes_uniform = (torch.cat((spikes_train_uniform, spikes_test_uniform), dim=0)).squeeze(-1).cpu().numpy()
+    errors_uniform = torch.square(errors_test_uniform).sum().cpu().numpy() * dt
+    errors_matrix.append((1, float('inf'), errors_uniform))
+    spike_counts_uniform = spikes_uniform.sum(axis=0)
+    print(f"Device: {device} | spikes (uniform delay): {spike_counts_uniform.mean():.2f}")
+
+    df = pd.DataFrame(errors_matrix, columns=["alpha", "tau", "error"])
+
+    df["alpha_label"] = df["alpha"].replace({float('inf'): "delta"})
+    df["tau_label"] = df["tau"].replace({
+        0.0: "No delay",
+        float('inf'): "Uniform"
+    })
+
+    alpha_order = ["1.0", "2.0", "5.0", "10.0", "20.0", "30.0", "40.0", "Δ"]
+    tau_order = ["No delay", "0.5", "1.0", "2.0", "5.0", "10.0", "20.0", "40.0", "70.0", "100.0", "Uniform"]
+
+    df = pd.DataFrame(errors_matrix, columns=["alpha", "tau", "error"])
+
+    # 将 alpha = inf 替换成标签 "Delta"，tau = inf 替换成 "Uniform"
+    df["alpha_label"] = df["alpha"].replace({float('inf'): "Delta"})
+    df["tau_label"] = df["tau"].replace({float('inf'): "Uniform", 0.0: "Nodelay"})
+
+    # 透视表（pivot table）
+    pivot = df.pivot_table(index="alpha_label", columns="tau_label", values="error")
+
+    # 确保数据都是数值（去掉可能的字符串）
+    pivot = pivot.apply(pd.to_numeric, errors='coerce')
+    pivot = pivot.reindex(index=alpha_order, columns=tau_order)
+
+    # 绘图
+    plt.figure(figsize=(10, 6))
+    plt.imshow(pivot, cmap="viridis", aspect="auto")
+    plt.colorbar(label="Error")
+
+    # 设置坐标轴标签
+    plt.xticks(np.arange(len(pivot.columns)), pivot.columns, rotation=45)
+    plt.yticks(np.arange(len(pivot.index)), pivot.index)
+    plt.xlabel("⟨τ⟩ (mean tau)")
+    plt.ylabel("α")
+    plt.title("Error vs α and ⟨τ⟩")
+
+    plt.tight_layout()
+    plt.show()
 
 def test_lif(simtime=100.0, dt=0.1, num_neurons=10, noise_std=1000.0):
     '''
@@ -350,4 +448,5 @@ def test_lif(simtime=100.0, dt=0.1, num_neurons=10, noise_std=1000.0):
 
 if __name__ == "__main__":
     #test_lif()
-    simple_validation()
+    #simple_validation()
+    simple_validation_delay()
